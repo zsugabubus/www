@@ -65,7 +65,7 @@ www_log(enum LogLevel level, char const *format, ...)
 
 	switch (level) {
 	case DEBUG:
-		printf("[%s] %s\n", date, buf);
+		fprintf(stderr, "[%s] %s\n", date, buf);
 		break;
 
 	case ERROR:
@@ -151,16 +151,35 @@ serve_cmd(char *headers, int client)
 		return;
 	}
 
+	int verb_start, verb_end;
+	int path_start, path_end;
+	sscanf(headers, "%n%*[^ ]%n %n%*[^ ]%n HTTP",
+			&verb_start, &verb_end,
+			&path_start, &path_end);
+	if (path_end < 0) {
+		www_log(ERROR, "Malformed request");
+		return;
+	}
+	char const *path = headers + path_start + 1;
+	headers[path_end] = '\0';
+
+	www_log(DEBUG, "Request %s", path);
+
 	pid_t pid;
 	if (!(pid = vfork())) {
 		close(pair[0]);
+
 		close(STDIN_FILENO);
-		dup2(pair[1], STDOUT_FILENO);
+		dup2(open("/dev/null", O_RDONLY), STDIN_FILENO);
+
+		dup2(pair[1], STDOUT_FILENO),
 		close(pair[1]);
-		if (strcmp(command, "--"))
-			execlp("sh", "sh", "-c", command);
-		else
+
+		if (!strcmp(command, "--"))
 			execvp(command_args[0], command_args);
+		else
+			execlp("sh", "sh", "-euc", command,
+					"www-cmd", path, NULL);
 		www_log(FATAL, "Failed to spawn process");
 	} else if (0 < pid) {
 		enum { BUF_SIZE = 1 << 18 };
