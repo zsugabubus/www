@@ -1,6 +1,6 @@
 TARGET := www
 
-CFLAGS += -std=c11 -O2 -pthread
+CFLAGS += -std=c11 -O2 -pthread -Wall -Wextra
 
 all : $(TARGET)
 

@@ -1,24 +1,56 @@
-/* www - serving one file over HTTP
+/**
+ * www - serve a file over HTTP
  *
- * USAGE:
- *   $ www 8888 file
- *   $ www a.tar -- tar -cf - *
+ * SYNOPSIS
+ *   www [FILE=index.html] [[HOST=localhost][: PORT=8080]] [SHELL-COMMAND | -- COMMAND [ARG]...]
  *
- *   # On the other side:
- *   $ curl -OJ https://host:8888
- *   $ curl https://host:8080 | tar -xf -
+ * DESCRIPTION
+ *   Serve a file or the output of a command over HTTP.
+ *
+ * EXAMPLE
+ *
+ *   Serve a file:
+ *
+ *       $ www /etc/passwd :8000
+ *       # On the other side:
+ *       $ curl -OJ https://localhost:8000
+ *
+ *   Serve multiple files:
+ *
+ *       $ www a.tar 127.0.0.1 -- tar -cf - *.mkv
+ *       # On the other side:
+ *       $ curl https://127.0.0.1:8080 | tar -xf -
+ *
+ *   Serve a command:
+ *
+ *       $ www a.out : -- date +%s
+ *
+ *   Serve a shell command:
+ *
+ *       $ www : : 'yes | sed ='
+ *
+ *       $ www : : 'echo $0: Hello $1.'
+ *       # On the other side:
+ *       $ curl "https://localhost:8080/$USER"
+ *       www-cmd: Hello user
+ *
+ * COPYRIGHT
+ *   Public domain.
  */
+
 #define _GNU_SOURCE
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -27,6 +59,7 @@
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -38,24 +71,16 @@ enum LogLevel {
 	FATAL,
 };
 
-static in_port_t port;
-static char const *address;
+atomic_size_t nb_clients;
+
 static char const *path;
 static char const *filename;
-static char const *command;
-static char **command_args;
+static char **command;
 static int fd;
-
-static struct sigaction const sa_ignore = {
-	.sa_handler = SIG_IGN,
-	.sa_flags = SA_RESTART,
-};
 
 static void
 www_log(enum LogLevel level, char const *format, ...)
 {
-	int res = errno;
-
 	va_list ap;
 	va_start(ap, format);
 	char buf[512];
@@ -74,19 +99,53 @@ www_log(enum LogLevel level, char const *format, ...)
 
 	case ERROR:
 	case FATAL:
-		fprintf(stderr, "\e[31m[%s] \e[1m%s: %s\e[m\n", date, buf, strerror(res));
+		fprintf(stderr, "\e[31m[%s] \e[1m%s\e[m\n", date, buf);
 		if (FATAL == level)
 			exit(EXIT_FAILURE);
 		break;
 	}
 }
 
+static char *
+straddr(struct sockaddr const *sa)
+{
+	char addr_buf[INET6_ADDRSTRLEN];
+
+	static char buf[10 + 2 + 1 + sizeof addr_buf + 1 + 1 + sizeof "65536"];
+
+	void *addr = NULL;
+	in_port_t port = 0;
+
+	switch (sa ? sa->sa_family : AF_UNSPEC) {
+	case AF_INET:
+		addr = &((struct sockaddr_in *)sa)->sin_addr;
+		port = ((struct sockaddr_in *)sa)->sin_port;
+		break;
+
+	case AF_INET6:
+		addr = &((struct sockaddr_in6 *)sa)->sin6_addr;
+		port = ((struct sockaddr_in6 *)sa)->sin6_port;
+		break;
+
+	default:
+		return "(unknown)";
+	}
+
+	sprintf(buf, "%s%s%s:%"PRId32,
+			AF_INET != sa->sa_family ? "[" : "",
+			inet_ntop(sa->sa_family, addr, addr_buf, sizeof addr_buf),
+			AF_INET != sa->sa_family ? "]" : "",
+			ntohs(port));
+
+	return buf;
+}
+
 static void
-serve_file(char *headers, int client)
+serve_file(char *headers, int cfd)
 {
 	struct stat st;
 	if (fstat(fd, &st) < 0) {
-		www_log(ERROR, "Failed to stat file");
+		www_log(ERROR, "Failed to stat file: %s", strerror(errno));
 		return;
 	}
 
@@ -122,17 +181,17 @@ serve_file(char *headers, int client)
 			filename,
 			end_offset - offset,
 			offset, end_offset, st.st_size);
-	if (write(client, headers, size) < 0)
+	if (write(cfd, headers, size) < 0)
 		return;
 
-	if (sendfile(client, fd, &offset, end_offset - offset) < 0) {
-		www_log(ERROR, "Failed to send file");
+	if (sendfile(cfd, fd, &offset, end_offset - offset) < 0) {
+		www_log(ERROR, "Failed to send file: %s", strerror(errno));
 		return;
 	}
 }
 
 static void
-serve_cmd(char *headers, int client)
+serve_cmd(char *headers, int cfd)
 {
 	int size;
 	char head[1 << 10];
@@ -146,12 +205,12 @@ serve_cmd(char *headers, int client)
 			"Connection: close\r\n"
 			"\r\n",
 			filename);
-	if (write(client, head, size) < 0)
+	if (write(cfd, head, size) < 0)
 		return;
 
 	int pair[2];
 	if (pipe2(pair, O_CLOEXEC) < 0) {
-		www_log(ERROR, "Failed to open pipe");
+		www_log(ERROR, "Failed to open pipe: %s", strerror(errno));
 		return;
 	}
 
@@ -167,24 +226,23 @@ serve_cmd(char *headers, int client)
 	char const *path = headers + path_start + 1;
 	headers[path_end] = '\0';
 
-	www_log(DEBUG, "Request %s", path);
+	www_log(DEBUG, "Request '%s'", path);
 
 	pid_t pid;
 	if (!(pid = vfork())) {
-		close(pair[0]);
-
 		close(STDIN_FILENO);
 		dup2(open("/dev/null", O_RDONLY), STDIN_FILENO);
 
-		dup2(pair[1], STDOUT_FILENO),
-		close(pair[1]);
+		dup2(pair[1], STDOUT_FILENO);
 
-		if (!strcmp(command, "--"))
-			execvp(command_args[0], command_args);
+		if (!strcmp(command[0], "--"))
+			execvp(command[1], command + 1);
 		else
-			execlp("sh", "sh", "-euc", command,
-					"www-cmd", path, NULL);
-		www_log(FATAL, "Failed to spawn process");
+			execlp("sh", "sh", "-euc", command[0],
+					/* arg0= */ "www-cmd",
+					/* arg1= */ path,
+					NULL);
+		www_log(FATAL, "Failed to spawn process: %s", strerror(errno));
 	} else if (0 < pid) {
 		enum { BUF_SIZE = 1 << 18 };
 
@@ -204,8 +262,8 @@ serve_cmd(char *headers, int client)
 			*end++ = '\r';
 			*end++ = '\n';
 
-			if (write(client, start, end - start) < 0) {
-				www_log(ERROR, "Failed to write");
+			if (write(cfd, start, end - start) < 0) {
+				www_log(ERROR, "Failed to write: %s", strerror(errno));
 				break;
 			}
 
@@ -218,11 +276,11 @@ serve_cmd(char *headers, int client)
 }
 
 static int
-parse_request(int client, char *headers, size_t headers_size)
+parse_request(int cfd, char *headers, size_t headers_size)
 {
-	int size = read(client, headers, headers_size - 1);
+	int size = read(cfd, headers, headers_size - 1);
 	if (size < 0) {
-		www_log(ERROR, "Failed to read headers");
+		www_log(ERROR, "Failed to read headers: %s", strerror(errno));
 		return -1;
 	}
 	headers[size] = '\0';
@@ -233,20 +291,35 @@ parse_request(int client, char *headers, size_t headers_size)
 static void *
 worker(void *arg)
 {
-	int client = (int)(uintptr_t)arg;
+	atomic_fetch_add_explicit(&nb_clients, 1, memory_order_relaxed);
+
+	union {
+		struct sockaddr sa;
+		struct sockaddr_in sin;
+		struct sockaddr_in6 sin6;
+	} csa;
+
+	int cfd = (int)(uintptr_t)arg;
+
+	struct sockaddr *csa_sa = 0 <= getpeername(cfd, &csa.sa, &(socklen_t){ sizeof csa }) ? &csa.sa : NULL;
+
+	www_log(DEBUG, "Hello %s", straddr(csa_sa));
 
 	char headers[4096];
-	if (0 <= parse_request(client, headers, sizeof headers)) {
+	if (0 <= parse_request(cfd, headers, sizeof headers)) {
 		if (!command)
-			serve_file(headers, client);
+			serve_file(headers, cfd);
 		else
-			serve_cmd(headers, client);
+			serve_cmd(headers, cfd);
 	}
 
-	www_log(DEBUG, "Close %d", client);
+	www_log(DEBUG, "Bye %s", straddr(csa_sa));
 
-	shutdown(client, SHUT_RDWR);
-	close(client);
+	shutdown(cfd, SHUT_RDWR);
+	close(cfd);
+
+	if (1 == atomic_fetch_sub_explicit(&nb_clients, 1, memory_order_relaxed))
+		www_log(DEBUG, "All clients gone");
 
 	return NULL;
 }
@@ -254,85 +327,108 @@ worker(void *arg)
 int
 main(int argc, char *argv[])
 {
-	if (0) {
-	help:
-		errno = -EINVAL;
-		www_log(ERROR, "Failed to parse arguments");
-		return EXIT_FAILURE;
-	}
+	static struct sigaction const SA_IGNORE = {
+		.sa_handler = SIG_IGN,
+		.sa_flags = SA_RESTART,
+	};
 
-	char **arg = &argv[1];
+	sigaction(SIGCHLD, &SA_IGNORE, NULL);
+	sigaction(SIGHUP, &SA_IGNORE, NULL);
+	sigaction(SIGPIPE, &SA_IGNORE, NULL);
+	sigaction(SIGWINCH, &SA_IGNORE, NULL);
 
-	if (!*arg)
-		goto help;
-	int pos = 0;
-	sscanf(*arg, "%*[^:]:%n%hu", &pos, &port);
-	if (0 < pos) {
-		address = *arg;
-		(*arg)[pos - 1] = '\0';
-		++arg;
-	} else {
-		sscanf(*arg, "%hu%n", &port, &pos);
-		if (1 < pos && !(*arg)[pos])
-			++arg;
-		else
-			port = 0;
-	}
-
-	if (!port)
-		port = 8080;
-
-	if (!*arg)
-		goto help;
-	path = *arg++;
+	path = 1 < argc ? argv[1] : "index.html";
 	if ((filename = strrchr(path, '/')))
 		++filename;
 	else
 		filename = path;
 
-	command = *arg;
-	command_args = arg + 1;
+	if (argc <= 3 && (fd = open(path, O_CLOEXEC | O_RDONLY)) < 0)
+		www_log(FATAL, "Failed to open %s: %s", path, strerror(errno));
 
-	if (!command && (fd = open(path, O_CLOEXEC | O_RDONLY)) < 0)
-		www_log(FATAL, "Failed to open input file '%s'", path);
+	char const *node = "localhost";
+	char const *service = "8080";
 
-	int server;
-	if ((server = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0)
-		www_log(FATAL, "Failed to open socket");
+	if (2 < argc) {
+		char const *p = argv[2];
+		if (':' == *p) {
+			if (p[1])
+				service = p + 1;
+		} else if ('[' == *p) {
+			node = p + 1;
+			p = strchr(node, ']');
+			if (p) {
+				*(char *)p = '\0';
+				if (':' == p[1] && p[2])
+					service = p + 2;
+			}
+		} else {
+			node = p;
+			p = strchr(node, ':');
+			if (p) {
+				*(char *)p = '\0';
+				if (p[1])
+					service = p + 1;
+			}
+		}
+	}
 
-	static int const YES = 1;
-	if (setsockopt(server, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &YES, sizeof YES))
-		www_log(ERROR, "Failed to set socket options");
-
-	struct sockaddr_in sin = {
-		.sin_family = AF_INET,
-		.sin_addr.s_addr = !address ? INADDR_ANY : inet_addr(address),
-		.sin_port = htons(port),
+	struct addrinfo *info, hints = {
+		.ai_family = AF_UNSPEC,
+		.ai_socktype = SOCK_STREAM,
+		.ai_protocol = IPPROTO_TCP,
+		.ai_flags = AI_CANONNAME,
 	};
 
-	if (bind(server, (struct sockaddr *)&sin, sizeof sin) < 0)
-		www_log(FATAL, "Failed to bind to %s:%d",
-				inet_ntoa(sin.sin_addr), ntohs(sin.sin_port));
+	for (int res; (res = getaddrinfo(node, service, &hints, &info));)
+		www_log(FATAL, "Failed to resolve address: %s",
+				EAI_SYSTEM == res
+					? strerror(errno)
+					: gai_strerror(res));
 
-	if (listen(server, 2) < 0)
-		www_log(FATAL, "Failed to listen on %s:%d",
-				inet_ntoa(sin.sin_addr), ntohs(sin.sin_port));
+	int sfd = -1;
 
-	sigaction(SIGCHLD, &sa_ignore, NULL);
-	sigaction(SIGHUP, &sa_ignore, NULL);
-	sigaction(SIGPIPE, &sa_ignore, NULL);
-	sigaction(SIGWINCH, &sa_ignore, NULL);
+	for (struct addrinfo *ai = info; ai; ai = ai->ai_next) {
+		sfd = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC, ai->ai_protocol);
+		if (sfd < 0)
+			continue;
 
-	www_log(DEBUG, "Listening on http://%s:%d",
-			inet_ntoa(sin.sin_addr), ntohs(sin.sin_port));
+		static int const YES = 1;
+		if (setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &YES, sizeof YES) < 0)
+			www_log(ERROR, "Failed to set socket options");
 
-	for (int client;
-	     0 <= (client = accept(server, (struct sockaddr *)&sin, (socklen_t[]){ sizeof sin }));)
-	{
-		www_log(DEBUG, "Accept %d: %s", client, inet_ntoa(sin.sin_addr));
+		if (bind(sfd, ai->ai_addr, ai->ai_addrlen) < 0) {
+			www_log(ERROR, "Failed to bind to %s", straddr(ai->ai_addr));
+			close(sfd);
+			continue;
+		}
 
+		if (listen(sfd, 2) < 0) {
+			www_log(FATAL, "Failed to listen on %s: %s", straddr(ai->ai_addr), strerror(errno));
+			close(sfd);
+			continue;
+		}
+
+		www_log(DEBUG, "Listening on http://%s%s%s%s",
+				straddr(ai->ai_addr),
+				ai->ai_canonname ? " (" : "",
+				ai->ai_canonname ? ai->ai_canonname : "",
+				ai->ai_canonname ? ")" : "");
+
+		break;
+	}
+
+	freeaddrinfo(info);
+
+	if (sfd < 0)
+		www_log(FATAL, "Failed to open socket: %s", strerror(errno));
+
+	if (3 < argc)
+		command = &argv[3];
+
+	for (int cfd; 0 <= (cfd = accept(sfd, NULL, NULL));) {
 		pthread_t thread;
-		pthread_create(&thread, NULL, worker, (void *)(uintptr_t)client);
+		pthread_create(&thread, NULL, worker, (void *)(uintptr_t)cfd);
 	}
 
 	return EXIT_FAILURE;
