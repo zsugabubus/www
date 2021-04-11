@@ -1,8 +1,12 @@
 /* www - serving one file over HTTP
  *
  * USAGE:
- *   www      a.tar -- tar -cf - dir
- *   www 8888 file
+ *   $ www 8888 file
+ *   $ www a.tar -- tar -cf - *
+ *
+ *   # On the other side:
+ *   $ curl -OJ https://host:8888
+ *   $ curl https://host:8080 | tar -xf -
  */
 #define _GNU_SOURCE
 
