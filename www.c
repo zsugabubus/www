@@ -172,7 +172,7 @@ www_write(int cfd, char const *buf, size_t buf_size)
 }
 
 static int
-www_write_chunked(int fd, char const *buf, size_t buf_size)
+www_write_chunk(int fd, char const *buf, size_t buf_size)
 {
 	struct iovec iov[3];
 	char prefix[sizeof buf_size * 2 + 2];
@@ -465,7 +465,7 @@ www_serve_cmd(int cfd, HTTPRequest *req)
 		char buf[1 << 18];
 
 		while (0 <= (size = read(pair[0], buf, sizeof buf)))
-			if (www_write_chunked(cfd, buf, size) < 0 || !size)
+			if (www_write_chunk(cfd, buf, size) < 0 || !size)
 				break;
 
 		close(pair[0]);
@@ -652,7 +652,7 @@ www_serve_file(int cfd, HTTPRequest *req)
 					PATH_MAX, req->path,
 					req->path); /* Could be longer because of ./..///dir/././. */
 			if ((int)sizeof buf <= buf_size ||
-			    www_write_chunked(cfd, buf, buf_size) < 0)
+			    www_write_chunk(cfd, buf, buf_size) < 0)
 				goto out;
 		}
 
@@ -679,7 +679,7 @@ www_serve_file(int cfd, HTTPRequest *req)
 				buf_size = sprintf(buf, "%s\n", dent->d_name);
 			}
 
-			if (www_write_chunked(cfd, buf, buf_size) < 0)
+			if (www_write_chunk(cfd, buf, buf_size) < 0)
 				goto out;
 		}
 
@@ -689,10 +689,10 @@ www_serve_file(int cfd, HTTPRequest *req)
 					"</pre>\n"
 					"</body>\n"
 					"</html>\n");
-			if (www_write_chunked(cfd, buf, buf_size) < 0)
+			if (www_write_chunk(cfd, buf, buf_size) < 0)
 				goto out;
 		}
-		if (www_write_chunked(cfd, "", 0) < 0)
+		if (www_write_chunk(cfd, "", 0) < 0)
 			goto out;
 	} else if (S_ISREG(st.st_mode)) {
 		if (sendfile(cfd, fd, &offset, end_offset - offset) < 0) {
