@@ -266,9 +266,9 @@ www_sanitize_uri(HTTPRequest *req)
 			src += 1;
 		/* /../ -> /. */
 		else if ('/' == src[0] &&
-		    '.' == src[1] &&
-		    '.' == src[2] &&
-		    ('/' == src[3] || !src[3]))
+		         '.' == src[1] &&
+		         '.' == src[2] &&
+		         ('/' == src[3] || !src[3]))
 			src += 3;
 		/* // -> / */
 		else if ('/' == src[0] &&
@@ -495,9 +495,10 @@ www_serve_file(int cfd, HTTPRequest *req)
 	struct stat st;
 
 	if (fstat(fd, &st) < 0) {
+		int res;
 		ret = www_serve_cmd(cfd, req);
 		if (ret) {
-			www_log(ERROR, "Failed to stat file: %s", strerror(errno));
+			www_log(ERROR, "Failed to stat file: %s", strerror(res));
 			return HTTP_500_INTERNAL_SERVER_ERROR;
 		}
 		return ret;
