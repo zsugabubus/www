@@ -209,7 +209,7 @@ www_write_response(int cfd, char const *status)
 			"Content-Type: text/html; charset=UTF-8\r\n"
 			"\r\n"
 			"<!DOCTYPE html>\n"
-			"<html>\n"
+			"<html lang=\"en\">\n"
 			"<head></head>\n"
 			"<body>\n"
 			"\t<pre><h1 style=\"text-align: center\">%s</h1><hr></pre>\n"
@@ -783,7 +783,7 @@ main(int argc, char *argv[])
 	if ((main_fd = open(path, O_CLOEXEC | O_RDONLY)) < 0)
 		www_log(DEBUG, "%s: %s", path, strerror(errno));
 
-	char const *node = "localhost";
+	char const *node = "0";
 	char const *service = "8080";
 
 	if (2 < argc) {
