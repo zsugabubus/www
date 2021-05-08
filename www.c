@@ -34,6 +34,10 @@
  *       $ curl "https://localhost:8080/$USER"
  *       www-cmd: Hello user
  *
+ *    Serve content with CGI (command output includes headers):
+ *
+ *       $ www : :4444 --- git http-backend
+ *
  *   Serve directory as a playlist:
  *
  *       $ www ~/music : 'echo "#EXTM3U"; printf "%s\n" *.mp3'
@@ -68,6 +72,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -89,6 +94,14 @@ enum LogLevel {
 };
 
 typedef struct {
+	int fd;
+	struct sockaddr *sa;
+	union {
+		struct sockaddr sa;
+		struct sockaddr_in sin;
+		struct sockaddr_in6 sin6;
+	} csa;
+
 	char *method;
 	char *path;
 	char *query;
@@ -127,7 +140,8 @@ www_log(enum LogLevel level, char const *format, ...)
 	case FATAL:
 		fprintf(stderr, "\e[31m[%s] \e[1m%s\e[m\n", date, buf);
 		if (FATAL == level)
-			exit(EXIT_FAILURE);
+			/* FIXME: Should be exit() outside fork. */
+			_exit(EXIT_FAILURE);
 		break;
 
 	default:
@@ -259,6 +273,10 @@ www_straddr(struct sockaddr const *sa)
 static void
 www_sanitize_uri(HTTPRequest *req)
 {
+	/* When URI is sent to CGI do not touch it. */
+	if (command && !strcmp(command[0], "---"))
+		return;
+
 	char *dest = req->path;
 	for (char *src = dest; *src;)
 		/* ^/ -> ^ */
@@ -290,9 +308,9 @@ www_sanitize_uri(HTTPRequest *req)
 }
 
 static char const *
-www_parse_request(int cfd, HTTPRequest *req)
+www_parse_request(HTTPRequest *req)
 {
-	ssize_t size = read(cfd, req->buf, sizeof req->buf - 1);
+	ssize_t size = read(req->fd, req->buf, sizeof req->buf - 1);
 	if (size < 0) {
 		www_log(ERROR, "Failed to read headers: %s", strerror(errno));
 		return HTTP_400_BAD_REQUEST;
@@ -304,19 +322,16 @@ www_parse_request(int cfd, HTTPRequest *req)
 
 	char *p = req->buf;
 
-	if (!(p = memchr((req->method = p), ' ', buf_end - p))) {
-	bad_request:
-		www_log(ERROR, "Bad request");
+	if (!(p = memchr((req->method = p), ' ', buf_end - p)))
 		return HTTP_400_BAD_REQUEST;
-	}
 	*p++ = '\0';
 
 	if (!(p = memchr((req->path = p), ' ', buf_end - p)))
-		goto bad_request;
+		return HTTP_400_BAD_REQUEST;
 	*p++ = '\0';
 
 	if (req->buf + buf_size < p + 10 || memcmp(p, "HTTP/1.1\r\n", 10))
-		goto bad_request;
+		return HTTP_400_BAD_REQUEST;
 	p += 10;
 
 	req->headers = p;
@@ -394,44 +409,53 @@ www_get_header(HTTPRequest const *req, char const *s)
 }
 
 static char const *
-www_serve_cmd(int cfd, HTTPRequest *req)
+www_serve_cmd(HTTPRequest *req)
 {
 	if (!command)
 		return HTTP_500_INTERNAL_SERVER_ERROR;
 
-	int size;
-	char headers[1 << 10];
+	char buf[1 << 18];
+	ssize_t size;
 
-	size = snprintf(headers, sizeof headers,
-			"HTTP/1.1 200 OK\r\n"
-			"Cache-Control: no-cache\r\n"
-			"Transfer-Encoding: chunked\r\n"
-			"Content-Type: application/octet-stream\r\n"
-			"Content-Disposition: attachment; filename=\"%s\"\r\n"
-			"Connection: close\r\n"
-			"\r\n",
-			filename);
-	if ((int)sizeof headers <= size)
+	/* Is CGI? */
+	if (!strcmp(command[0], "---")) {
+		size = snprintf(buf, sizeof buf, "HTTP/1.1 200 OK\r\n");
+	} else {
+		size = snprintf(buf, sizeof buf,
+				"HTTP/1.1 200 OK\r\n"
+				"Cache-Control: no-cache\r\n"
+				"Transfer-Encoding: chunked\r\n"
+				"Content-Type: application/octet-stream\r\n"
+				"Content-Disposition: attachment; filename=\"%s\"\r\n"
+				"Connection: close\r\n"
+				"\r\n",
+				filename);
+	}
+	if ((ssize_t)sizeof buf <= size)
 		return HTTP_500_INTERNAL_SERVER_ERROR;
-	if (www_write(cfd, headers, size) < 0)
+	if (www_write(req->fd, buf, size) < 0)
 		return HTTP_500_INTERNAL_SERVER_ERROR;
 
 	int pair[2];
-	if (pipe2(pair, O_CLOEXEC) < 0) {
+
+	if (!strcmp(command[0], "---")) {
+		pair[0] = -1;
+		pair[1] = req->fd;
+	} else if (pipe2(pair, O_CLOEXEC) < 0) {
 		www_log(ERROR, "Failed to open pipe: %s", strerror(errno));
 		return HTTP_500_INTERNAL_SERVER_ERROR;
 	}
 
 	pid_t pid;
-	if (!(pid = vfork())) {
-		close(STDIN_FILENO);
-		dup2(!strcmp(req->method, "GET")
-			? open("/dev/null", O_CLOEXEC | O_RDONLY)
-			: cfd, STDIN_FILENO);
+	if (!(pid = fork())) {
+		if (close(STDIN_FILENO) < 0 ||
+		    dup2(!strcmp(req->method, "GET")
+		         ? open("/dev/null", O_CLOEXEC | O_RDONLY)
+		         : req->fd, STDIN_FILENO) < 0 ||
+		    dup2(pair[1], STDOUT_FILENO) < 0 ||
+		    (0 <= main_fd && fchdir(main_fd) < 0 && ENOTDIR != errno))
+			www_log(FATAL, "Failed initialize process: %s", strerror(errno));
 
-		dup2(pair[1], STDOUT_FILENO);
-
-		fchdir(main_fd);
 		for (char const *header = req->headers; *header;) {
 			char const *value = header + strlen(header) + 1 /* : */;
 
@@ -446,46 +470,59 @@ www_serve_cmd(int cfd, HTTPRequest *req)
 			header = value + strlen(value) + 2 /* \r\n */;
 		}
 
-		if (!strcmp(command[0], "--")) {
-			www_log(DEBUG, "Spawning %s", command[1]);
+		setenv("REQUEST_METHOD", req->method, 0);
+		if (req->query)
+			setenv("QUERY_STRING", req->query, 0);
+		setenv("PATH_INFO", req->path, 0);
+		/* FIXME: :port should be probably stripped. */
+		char const *remote_addr = www_straddr(req->sa);
+		if (remote_addr)
+			setenv("REMOTE_ADDR", remote_addr, 0);
+		setenv("GATEWAY_INTERFACE", "CGI/1.1", 0);
+		setenv("SERVER_PROTOCOL", "HTTP/1.1", 0);
+
+		if ('-' == command[0][0] &&
+		    '-' == command[0][1])
+			www_log(DEBUG, "Spawning %s", command[1]),
 			execvp(command[1], command + 1);
-		} else {
-			www_log(DEBUG, "Spawning %s -c '%s'", shell, command[0]);
+		else
+			www_log(DEBUG, "Spawning %s -c '%s'", shell, command[0]),
 			execlp(shell, shell, "-euc", command[0],
 					/* argv[0] = */ "www-cmd",
 					/* argv[1] = */ req->method,
 					/* argv[2] = */ req->path,
 					/* argv[3] = */ req->query,
 					NULL);
-		}
 		www_log(FATAL, "Failed to spawn process: %s", strerror(errno));
 	} else if (0 < pid) {
-		close(pair[1]);
+		if (!strcmp(command[0], "---")) {
+			waitpid(pid, NULL, 0);
+		} else {
+			close(pair[1]);
 
-		char buf[1 << 18];
+			while (0 <= (size = read(pair[0], buf, sizeof buf)))
+				if (www_write_chunk(req->fd, buf, size) < 0 || !size)
+					break;
 
-		while (0 <= (size = read(pair[0], buf, sizeof buf)))
-			if (www_write_chunk(cfd, buf, size) < 0 || !size)
-				break;
-
-		close(pair[0]);
+			close(pair[0]);
+		}
 	}
 
 	return NULL;
 }
 
 static char const *
-www_serve_file(int cfd, HTTPRequest *req)
+www_serve_file(HTTPRequest *req)
 {
-	if (req->query)
-		return www_serve_cmd(cfd, req);
+	if (req->query || (command && !strcmp(command[0], "---")))
+		return www_serve_cmd(req);
 
 	char const *ret = NULL;
 
 	if (strcmp(req->method, "GET") &&
 	    strcmp(req->method, "HEAD"))
 	{
-		ret = www_serve_cmd(cfd, req);
+		ret = www_serve_cmd(req);
 		if (ret)
 			ret = HTTP_405_METHOD_NOT_ALLOWED;
 		return ret;
@@ -495,11 +532,11 @@ www_serve_file(int cfd, HTTPRequest *req)
 	struct stat st;
 
 	if (fstat(fd, &st) < 0) {
-		int res;
-		ret = www_serve_cmd(cfd, req);
+		int err = errno;
+		ret = www_serve_cmd(req);
 		if (ret) {
-			www_log(ERROR, "Failed to stat file: %s", strerror(res));
-			return HTTP_500_INTERNAL_SERVER_ERROR;
+			www_log(ERROR, "Failed to stat file: %s", strerror(err));
+			ret = HTTP_500_INTERNAL_SERVER_ERROR;
 		}
 		return ret;
 	}
@@ -525,7 +562,7 @@ www_serve_file(int cfd, HTTPRequest *req)
 	if (S_ISDIR(st.st_mode)) {
 		/* Serve command instead of root directory. */
 		if (!*req->path) {
-			ret = www_serve_cmd(cfd, req);
+			ret = www_serve_cmd(req);
 			if (ret)
 				ret = NULL;
 			else
@@ -555,8 +592,10 @@ www_serve_file(int cfd, HTTPRequest *req)
 			goto out;
 		}
 	} else if (S_ISREG(st.st_mode)) {
-		if (*req->path)
-			return HTTP_404_NOT_FOUND;
+		if (*req->path) {
+			ret = HTTP_404_NOT_FOUND;
+			goto out;
+		}
 	}
 
 	if (S_ISDIR(st.st_mode)) {
@@ -623,7 +662,7 @@ www_serve_file(int cfd, HTTPRequest *req)
 		}
 	}
 
-	if (www_write(cfd, headers, headers_size) < 0) {
+	if (www_write(req->fd, headers, headers_size) < 0) {
 		ret = HTTP_500_INTERNAL_SERVER_ERROR;
 		goto out;
 	}
@@ -653,7 +692,7 @@ www_serve_file(int cfd, HTTPRequest *req)
 					PATH_MAX, req->path,
 					req->path); /* Could be longer because of ./..///dir/././. */
 			if ((int)sizeof buf <= buf_size ||
-			    www_write_chunk(cfd, buf, buf_size) < 0)
+			    www_write_chunk(req->fd, buf, buf_size) < 0)
 				goto out;
 		}
 
@@ -680,7 +719,7 @@ www_serve_file(int cfd, HTTPRequest *req)
 				buf_size = sprintf(buf, "%s\n", dent->d_name);
 			}
 
-			if (www_write_chunk(cfd, buf, buf_size) < 0)
+			if (www_write_chunk(req->fd, buf, buf_size) < 0)
 				goto out;
 		}
 
@@ -690,13 +729,13 @@ www_serve_file(int cfd, HTTPRequest *req)
 					"</pre>\n"
 					"</body>\n"
 					"</html>\n");
-			if (www_write_chunk(cfd, buf, buf_size) < 0)
+			if (www_write_chunk(req->fd, buf, buf_size) < 0)
 				goto out;
 		}
-		if (www_write_chunk(cfd, "", 0) < 0)
+		if (www_write_chunk(req->fd, "", 0) < 0)
 			goto out;
 	} else if (S_ISREG(st.st_mode)) {
-		if (sendfile(cfd, fd, &offset, end_offset - offset) < 0) {
+		if (sendfile(req->fd, fd, &offset, end_offset - offset) < 0) {
 			www_log(ERROR, "Failed to send file: %s", strerror(errno));
 			goto out;
 		}
@@ -717,34 +756,28 @@ www_worker(void *arg)
 {
 	atomic_fetch_add_explicit(&nb_clients, 1, memory_order_relaxed);
 
-	int cfd = (int)(uintptr_t)arg;
-
-	union {
-		struct sockaddr sa;
-		struct sockaddr_in sin;
-		struct sockaddr_in6 sin6;
-	} csa;
-
 	struct timespec start;
 	clock_gettime(CLOCK_MONOTONIC, &start);
 
-	struct sockaddr *csa_sa = 0 <= getpeername(cfd, &csa.sa, &(socklen_t){ sizeof csa }) ? &csa.sa : NULL;
+	HTTPRequest req;
+	req.fd = (int)(uintptr_t)arg;;
+	req.sa = 0 <= getpeername(req.fd, &req.csa.sa, &(socklen_t){ sizeof req.csa }) ? &req.csa.sa : NULL;
 
-	www_log(DEBUG, "Hello %s", www_straddr(csa_sa));
+	www_log(DEBUG, "Hello %s", www_straddr(req.sa));
 
 	char const *status;
-	HTTPRequest req;
-	if ((status = www_parse_request(cfd, &req)) ||
-	    (status = www_serve_file(cfd, &req)))
-		www_write_response(cfd, status);
+
+	if ((status = www_parse_request(&req)) ||
+	    (status = www_serve_file(&req)))
+		www_write_response(req.fd, status);
 
 	struct timespec end;
 	clock_gettime(CLOCK_MONOTONIC, &end);
 
-	shutdown(cfd, SHUT_RDWR);
-	close(cfd);
+	shutdown(req.fd, SHUT_RDWR);
+	close(req.fd);
 
-	www_log(DEBUG, "Bye %s (alive for %1.3f seconds)", www_straddr(csa_sa),
+	www_log(DEBUG, "Bye %s (alive for %1.3f seconds)", www_straddr(req.sa),
 			(double)((end.tv_sec - start.tv_sec) * NSEC_PER_SEC + (end.tv_nsec - start.tv_nsec)) / NSEC_PER_SEC);
 
 	if (1 == atomic_fetch_sub_explicit(&nb_clients, 1, memory_order_relaxed))
@@ -818,7 +851,9 @@ main(int argc, char *argv[])
 		.ai_flags = AI_CANONNAME,
 	};
 
-	for (int res; (res = getaddrinfo(node, service, &hints, &info));)
+	int res;
+	res = getaddrinfo(node, service, &hints, &info);
+	if (res)
 		www_log(FATAL, "Failed to resolve address: %s",
 				EAI_SYSTEM == res
 					? strerror(errno)
@@ -864,9 +899,14 @@ main(int argc, char *argv[])
 	if (3 < argc)
 		command = &argv[3];
 
+	pthread_attr_t attr;
+	if (pthread_attr_init(&attr) ||
+	    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED))
+		www_log(FATAL, "Failed to initialize worker threads: %s", strerror(errno));
+
 	for (int cfd; 0 <= (cfd = accept(sfd, NULL, NULL));) {
 		pthread_t thread;
-		if (pthread_create(&thread, NULL, www_worker, (void *)(uintptr_t)cfd)) {
+		if (pthread_create(&thread, &attr, www_worker, (void *)(uintptr_t)cfd)) {
 			close(cfd);
 			www_log(ERROR, "Failed to create worker: %s", strerror(errno));
 		}
