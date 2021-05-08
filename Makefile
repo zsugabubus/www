@@ -29,4 +29,7 @@ check:
 	timeout 1s ./$(TARGET) .git 0:12006 & \
 	curl -s http://0:12006 | grep HEAD
 
+	GIT_HTTP_EXPORT_ALL=1 GIT_PROJECT_ROOT=$$PWD timeout 1s ./$(TARGET) . 0:12007 --- git http-backend & \
+	curl -s http://0:12007/HEAD | grep ref:
+
 .PHONY : all check
